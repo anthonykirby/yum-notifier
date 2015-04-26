@@ -1,0 +1,321 @@
+#!/usr/bin/perl -w
+use strict;
+
+#    yum-notifier, a simple YUM update checker that handles suspend/resume
+#
+#    Copyright (C) 2015  Anthony Kirby - anthony@anthony.org
+#
+#    This program is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License along
+#    with this program; if not, write to the Free Software Foundation, Inc.,
+#    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+
+use POSIX ":sys_wait_h";
+use File::Basename;
+
+use File::Temp qw/tempfile/;
+use Config::Simple;		# RPM: perl-Config-Simple
+
+my $program = basename($0);
+openlog($program, "ndelay,pid", "local0");
+use Sys::Syslog qw(:standard :macros);		# perl-Sys-Syslog
+syslog(LOG_INFO, "started");
+use Gtk2 '-init';	# RPM: perl-Gtk2
+
+my $CONFIG_FILE='yum-notifier.cfg';
+my $cfg = new Config::Simple($CONFIG_FILE);
+die "missing config file '$CONFIG_FILE'" unless -r $CONFIG_FILE;
+die "failed to read config file '$CONFIG_FILE'" unless $cfg;
+
+my $RESUME_HOLDOFF = $cfg->param('ResumeHoldoff');
+die "missing config 'ResumeHoldoff'" unless $RESUME_HOLDOFF;
+
+# how often to refresh display/status
+my $REFRESH_INTERVAL = 1;	# seconds
+
+# how often to check for updates
+my $CHECK_INTERVAL = $cfg->param('UpdateCheckInterval');
+die "missing config 'UpdateCheckInterval'" unless $CHECK_INTERVAL;
+
+my $IMAGES_LOCATION='images';	# TODO
+
+
+# see http://gtk2-perl.sourceforge.net/doc/gtk2-perl-study-guide/index.html
+
+#my $statusicon = Gtk2::StatusIcon->new_from_pixbuf($icon_cur);
+my $statusicon = Gtk2::StatusIcon->new_from_file("$IMAGES_LOCATION/rpm.png");
+
+
+$statusicon->set_tooltip("yum-notifier");
+$statusicon->signal_connect( 'activate', \&pop_it );
+$statusicon->signal_connect( 'popup-menu', \&statusicon_context );
+
+#show in tray
+$statusicon->set_visible(1);
+
+# context menu
+my $contextmenu = Gtk2::Menu->new();
+my $contextmenu_check_now = Gtk2::ImageMenuItem->new_with_label( "Check Now" );
+$contextmenu_check_now->signal_connect( activate => \&context_click_check_now );
+$contextmenu->add( $contextmenu_check_now );
+my $contextmenu_quit = Gtk2::ImageMenuItem->new_with_label( "Quit" );
+$contextmenu_quit->signal_connect( activate => \&exit_it );
+$contextmenu_quit->set_image( Gtk2::Image->new_from_stock( 'gtk-quit', 'menu' ) );
+$contextmenu->add( $contextmenu_quit );
+
+detect_resume_start();
+consider_update_start();
+
+#end event loop
+Gtk2->main;
+
+
+
+sub exit_it {
+   Gtk2->main_quit;
+   return 0;
+}
+
+sub pop_it {
+#	$statusicon->set_from_file('rpm_bad.png');
+}
+
+sub context_click_check_now {
+	syslog(LOG_INFO, "click check now");
+	consider_update_callback(1);
+}
+
+sub statusicon_context {
+    my $ticon = shift;
+    my $event = shift;
+    my $time = shift;
+
+	$contextmenu->show_all;
+
+	#to position the menu under the icon, instead of at mouse position
+	my ($x, $y, $push) = Gtk2::StatusIcon::position_menu($contextmenu, $ticon);
+    $contextmenu->popup(undef, undef, sub {($x, $y,$push)}, undef, $event, $time);  
+  
+    $contextmenu->show_all;
+	return 1;
+}
+
+
+
+
+
+
+##############################################################################
+# decide whether to update
+
+our $consider_update_timer;
+our $latest_check;
+our $child_pid;
+
+sub consider_update_start {
+	$latest_check = 0;	# haven't checked yet
+	$child_pid = 0;
+
+	$consider_update_timer = Glib::Timeout->add($REFRESH_INTERVAL*1000, \&consider_update_callback);
+}
+
+our $yum_logfile;
+
+sub consider_update_callback {
+	my $user_requested = shift;
+	if ($child_pid) {
+		# there's a check in progress: see if it's finished
+		
+		syslog(LOG_INFO, "(monitoring progress: PID=$child_pid)");
+		
+		my $kid = waitpid($child_pid, POSIX::WNOHANG);
+		if ($kid > 0) {
+			my $child_exit = $? >> 8;
+			syslog(LOG_INFO, "child PID=$child_pid finished, with exit code $child_exit");
+			$child_pid = 0;
+			
+			# set "in progress" icon appropriately
+			if ($child_exit == 100) {
+				# update required
+				$statusicon->set_from_file("$IMAGES_LOCATION/rpm_update_required.png");
+				
+				$statusicon->set_tooltip("yum-notifier - update required!");				
+
+			} elsif ($child_exit == 0) {
+				# no update required
+				$statusicon->set_from_file("$IMAGES_LOCATION/rpm.png");
+				
+				my @time = localtime(time);
+				$statusicon->set_tooltip(sprintf('yum-notifier (last checked at %d:%02d)', $time[2],$time[1]));
+			} else {
+				# error
+				$statusicon->set_from_file("$IMAGES_LOCATION/rpm_eh.png");	# TODO
+			}
+			
+			my @contents = `cat $yum_logfile`;
+			syslog(LOG_INFO, "yum check-update returned:");
+			for my $line (@contents) {
+				syslog(LOG_INFO, "--> $line");
+			}
+			unlink ($yum_logfile);
+			
+			# re-enable menu
+			$contextmenu_check_now->set_sensitive(1);
+			
+			# reset time
+			$latest_check = time();
+		} else {
+			syslog(LOG_INFO, "(child still running)");
+		}
+	} else {
+		# should we start a check?		
+	
+		if ($user_requested
+				|| !recently_resumed() && time() - $latest_check > $CHECK_INTERVAL) {
+			# start a check
+			initiate_check();
+		}
+		else {
+#			syslog(LOG_INFO, "(no check needed)");
+		}
+	}
+	return 1;	# keep going
+}
+
+sub initiate_check {
+	syslog(LOG_INFO, "check update");
+	
+	# create file for 
+	(my $fh, $yum_logfile) = tempfile("yumcheck_XXXXXX", UNLINK => 1, TMPDIR => 1);
+	
+	$child_pid = fork();
+	if (!$child_pid) {
+		# child: run the check!
+		my $result = check_for_updates($yum_logfile);
+		# child returns result as exit code
+		exit $result;
+	} else {
+		# parent: update statuses etc
+		
+
+		# disable icon
+		$contextmenu_check_now->set_sensitive(0);
+		
+		# start "in progress" spinner
+		progress_spinner_start();
+	}
+}
+
+
+
+##############################################################################
+# update progress spinner
+
+our $progress_spinner_timer;
+our $PROGRESS_SPINNER_INTERVAL;	# how often to consider checking
+our $spinner_position;
+
+sub progress_spinner_start {
+	$PROGRESS_SPINNER_INTERVAL	= 150;	# milli-seconds
+	
+	$spinner_position = 1;
+
+	$progress_spinner_timer = Glib::Timeout->add($PROGRESS_SPINNER_INTERVAL, \&progress_spinner_callback);
+}
+
+sub progress_spinner_callback {
+	$spinner_position%=12;
+	$spinner_position++;
+
+	if ($child_pid) {
+		# still in progress
+		$statusicon->set_from_file(sprintf ("$IMAGES_LOCATION/progress_%02d.png", $spinner_position));
+		return 1;	# keep spinning
+	} else  {
+		return 0; 	# done
+	}
+}
+
+
+##############################################################################
+# suspend/resume detection
+
+our $detect_resume_timer;
+our $detect_resume_latest;
+
+our $DETECT_RESUME_TIMER_INTERVAL;
+our $DETECT_RESUME_INTERVAL;
+our $RESUME_THRESHOLD;
+
+our $most_recent_resume;
+
+sub detect_resume_start {
+	# how often to check time (s)
+	$DETECT_RESUME_TIMER_INTERVAL = 10;
+	
+	# how long is a resume?
+	$RESUME_THRESHOLD = 60;
+	
+	$detect_resume_latest = time();
+
+	$detect_resume_timer = Glib::Timeout->add($DETECT_RESUME_TIMER_INTERVAL*1000, \&detect_resume_callback);
+}
+
+sub detect_resume_callback {
+	#print "detect_resume_callback\n";
+	
+	my $now = time();
+	if ($now - $detect_resume_latest > $RESUME_THRESHOLD) {
+		# resume happened
+		print "resume detected!\n";
+		$most_recent_resume = $now;
+	}
+	$detect_resume_latest = $now;
+	return 1;	# keep going
+}
+sub recently_resumed {
+	return 0 if !$most_recent_resume;
+	return 0 if time() > $most_recent_resume + $RESUME_HOLDOFF;
+	return 1;
+}
+
+
+##############################################################################
+# check for updates
+
+sub check_for_updates {
+	my $yum_logfile = shift or die;
+	syslog(LOG_INFO, "(child process with PID=$$)");
+#	sleep (5);
+#	syslog(LOG_INFO, "child complete (PID=$$)");
+#	return 42;
+
+	syslog(LOG_INFO, "checking for updates...");
+#	sleep(5);
+	system ("yum check-update > $yum_logfile 2>&1");
+	if ($? == -1) {
+        syslog(LOG_ERR, "failed to execute: $!");
+        return -1;
+    }
+    elsif ($? & 127) {
+        syslog(LOG_ERR, "yum died with signal ".($? & 127));
+        return -1;
+    }
+    else {
+    	my $result = $? >> 8;
+        syslog(LOG_INFO, "yum returned $result");
+        return $result;
+    }
+	
+}
+
