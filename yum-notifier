@@ -74,6 +74,7 @@ $contextmenu_quit->set_image( Gtk2::Image->new_from_stock( 'gtk-quit', 'menu' ) 
 $contextmenu->add( $contextmenu_quit );
 
 detect_resume_start();
+detect_resume_callback();
 consider_update_start();
 
 #end event loop
@@ -180,9 +181,16 @@ sub consider_update_callback {
 	} else {
 		# should we start a check?		
 	
-		if ($user_requested
-				|| !recently_resumed() && time() - $latest_check > $CHECK_INTERVAL) {
+		if ($user_requested) {
 			# start a check
+			initiate_check();
+		}
+		elsif (recently_resumed()) {
+			# don't check if recently resumed
+			my $delta = recently_resumed();
+			$statusicon->set_tooltip(sprintf('yum-notifier (holdoff: resumed %d seconds ago)', $delta));
+		} 
+		elsif (time() - $latest_check > $CHECK_INTERVAL) {
 			initiate_check();
 		}
 		else {
@@ -266,8 +274,13 @@ sub detect_resume_start {
 	# how long is a resume?
 	$RESUME_THRESHOLD = 60;
 	
-	$detect_resume_latest = time();
+#	# when we first start, act as if we had just resumed (similar behaviour desired)
+#	$detect_resume_latest = time()-($RESUME_THRESHOLD+1);	
 
+	# when we first start, don't assume resume happened
+	$detect_resume_latest = time();	
+
+	# start polling...
 	$detect_resume_timer = Glib::Timeout->add($DETECT_RESUME_TIMER_INTERVAL*1000, \&detect_resume_callback);
 }
 
@@ -286,7 +299,7 @@ sub detect_resume_callback {
 sub recently_resumed {
 	return 0 if !$most_recent_resume;
 	return 0 if time() > $most_recent_resume + $RESUME_HOLDOFF;
-	return 1;
+	return time() - $most_recent_resume;
 }
 
 
